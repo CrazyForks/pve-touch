@@ -15,6 +15,11 @@
     <!-- Vue 3 -->
     <script src="https://unpkg.com/vue@3.3.13/dist/vue.global.prod.js"></script>
     
+    <!-- xterm.js -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    
     <style>
         [v-cloak] { display: none; }
         
@@ -62,6 +67,26 @@
         
         .progress-bar {
             transition: width 0.3s ease;
+        }
+        
+        /* Shell Terminal Styles */
+        #terminal {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .terminal-container {
+            background-color: #000;
+            height: calc(100vh - 120px);
+            padding: 10px;
+            overflow: hidden;
+        }
+        
+        .terminal-status {
+            position: absolute;
+            top: 70px;
+            right: 20px;
+            z-index: 10;
         }
     </style>
 </head>
@@ -152,7 +177,12 @@
                 <div class="flex-1">
                     <a class="btn btn-ghost text-xl">{{ nodename }}</a>
                 </div>
-                <div class="flex-none">
+                <div class="flex-none gap-2">
+                    <button @click="openNodeShell" class="btn btn-ghost btn-circle" title="主机 Shell">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                        </svg>
+                    </button>
                     <div class="dropdown dropdown-end">
                         <label tabindex="0" class="btn btn-ghost btn-circle">
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -304,6 +334,41 @@
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                             <span>{{ monitorCountdown }} 秒后自动刷新</span>
                         </div>
+                    </div>
+                </div>
+
+                <!-- Shell Page -->
+                <div v-show="currentPage === 'shell'" class="relative">
+                    <div class="mb-4 flex justify-between items-center">
+                        <button @click="closeShell" class="btn btn-ghost btn-sm">
+                            ← 返回列表
+                        </button>
+                        <h2 class="text-xl font-bold">{{ nodename }} - Shell</h2>
+                        <div class="w-20"></div>
+                    </div>
+
+                    <!-- 连接状态指示器 -->
+                    <div v-if="shell.connecting" class="terminal-status">
+                        <div class="badge badge-warning gap-2">
+                            <span class="loading loading-spinner loading-xs"></span>
+                            连接中...
+                        </div>
+                    </div>
+                    <div v-else-if="shell.connected" class="terminal-status">
+                        <div class="badge badge-success gap-2">
+                            <span class="inline-block w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                            已连接
+                        </div>
+                    </div>
+                    <div v-else-if="shell.error" class="terminal-status">
+                        <div class="badge badge-error gap-2">
+                            已断开
+                        </div>
+                    </div>
+
+                    <!-- 终端容器 -->
+                    <div class="terminal-container safe-area-bottom">
+                        <div id="terminal"></div>
                     </div>
                 </div>
 
@@ -632,30 +697,56 @@
                         show: false,
                         message: '',
                         type: 'success'
+                    },
+                    
+                    // Shell
+                    shell: {
+                        terminal: null,
+                        socket: null,
+                        ticket: null,
+                        port: null,
+                        connected: false,
+                        connecting: false,
+                        error: false,
+                        fitAddon: null
                     }
                 };
             },
             
-            mounted() {
-                // Check if already logged in from template
+            async mounted() {
+                // 三层认证检测：模板变量 → Cookie → localStorage
+                
+                // 第一层：检查服务器端模板变量（最优先）
                 if (this.username && this.csrfToken) {
                     this.authToken = this.csrfToken;
-                    // 设置 Cookie
-                    document.cookie = `PVEAuthCookie=${this.authToken}; path=/; SameSite=Strict`;
                     this.currentView = 'main';
                     this.fetchVMs();
-                } else {
-                    // Check localStorage for saved auth
-                    const savedAuth = this.getSavedAuth();
-                    if (savedAuth) {
-                        this.authToken = savedAuth.token;
-                        this.username = savedAuth.username;
-                        this.csrfToken = savedAuth.csrf;
-                        // 恢复 Cookie
-                        document.cookie = `PVEAuthCookie=${this.authToken}; path=/; SameSite=Strict`;
+                    return;
+                }
+                
+                // 第二层：检查浏览器 Cookie（服务器端设置的）
+                const existingCookie = this.getCookie('PVEAuthCookie');
+                if (existingCookie) {
+                    // 验证 Cookie 是否有效
+                    const authData = await this.verifyExistingAuth();
+                    if (authData) {
+                        this.authToken = existingCookie;
+                        this.username = authData.username;
+                        this.csrfToken = authData.token;
                         this.currentView = 'main';
                         this.fetchVMs();
+                        return;
                     }
+                }
+                
+                // 第三层：检查 localStorage（作为备份）
+                const savedAuth = this.getSavedAuth();
+                if (savedAuth) {
+                    this.authToken = savedAuth.token;
+                    this.username = savedAuth.username;
+                    this.csrfToken = savedAuth.csrf;
+                    this.currentView = 'main';
+                    this.fetchVMs();
                 }
             },
             
@@ -666,6 +757,8 @@
                 if (this.countdownInterval) {
                     clearInterval(this.countdownInterval);
                 }
+                // 清理 Shell 资源
+                this.cleanupShell();
             },
             
             computed: {
@@ -834,6 +927,45 @@
             },
             
             methods: {
+                // Utility methods
+                getCookie(name) {
+                    const value = `; ${document.cookie}`;
+                    const parts = value.split(`; ${name}=`);
+                    if (parts.length === 2) {
+                        return parts.pop().split(';').shift();
+                    }
+                    return null;
+                },
+                
+                async verifyExistingAuth() {
+                    // 尝试通过现有 Cookie 验证认证状态
+                    const cookie = this.getCookie('PVEAuthCookie');
+                    if (!cookie) {
+                        return false;
+                    }
+                    
+                    try {
+                        // 尝试获取当前用户信息来验证 Cookie 是否有效
+                        // 使用一个轻量级的 API 调用来验证
+                        const response = await this.apiRequest('GET', '/api2/json/access/ticket', null, true);
+                        
+                        // 如果 API 调用成功，说明 Cookie 有效
+                        // 从响应中提取用户信息
+                        if (response && response.data) {
+                            return {
+                                username: response.data.username || this.username,
+                                token: this.csrfToken
+                            };
+                        }
+                        
+                        return false;
+                    } catch (error) {
+                        // Cookie 无效或已过期
+                        console.log('Cookie verification failed:', error);
+                        return false;
+                    }
+                },
+                
                 // Auth methods
                 async login() {
                     this.loginForm.loading = true;
@@ -850,10 +982,10 @@
                             this.csrfToken = response.data.CSRFPreventionToken;
                             this.username = response.data.username;
                             
-                            // 手动设置 Cookie（浏览器可能不会自动设置跨域 Cookie）
-                            document.cookie = `PVEAuthCookie=${this.authToken}; path=/; SameSite=Strict`;
+                            // 不手动设置 Cookie，让浏览器自动处理服务器的 Set-Cookie 响应头
+                            // 这样可以确保 Cookie 与服务器端认证机制一致
                             
-                            // Save to localStorage
+                            // Save to localStorage as backup
                             this.saveAuth({
                                 token: this.authToken,
                                 csrf: this.csrfToken,
@@ -902,7 +1034,9 @@
                 clearAuth() {
                     try {
                         localStorage.removeItem('pve_auth');
-                        // 清除 Cookie
+                        // 清除 Cookie - 确保使用所有可能的属性
+                        document.cookie = 'PVEAuthCookie=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Strict';
+                        // 也尝试不带 SameSite 属性清除一次，以防万一
                         document.cookie = 'PVEAuthCookie=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
                     } catch (e) {
                         console.error('Failed to clear auth', e);
@@ -1410,6 +1544,166 @@
                     setTimeout(() => {
                         this.toast.show = false;
                     }, 3000);
+                },
+                
+                // Shell methods
+                async openNodeShell() {
+                    this.currentPage = 'shell';
+                    // 等待 DOM 更新
+                    await this.$nextTick();
+                    this.initShell();
+                },
+                
+                async initShell() {
+                    this.shell.connecting = true;
+                    this.shell.error = false;
+                    
+                    try {
+                        // 1. 创建终端代理会话
+                        const response = await this.apiRequest('POST', `/api2/json/nodes/${this.nodename}/termproxy`);
+                        
+                        if (!response.data) {
+                            throw new Error('Failed to create terminal session');
+                        }
+                        
+                        this.shell.ticket = response.data.ticket;
+                        this.shell.port = response.data.port;
+                        const user = response.data.user;
+                        
+                        // 2. 初始化 xterm.js 终端
+                        const terminal = new Terminal({
+                            cursorBlink: true,
+                            fontSize: 14,
+                            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                            theme: {
+                                background: '#000000',
+                                foreground: '#ffffff',
+                                cursor: '#ffffff',
+                                selection: 'rgba(255, 255, 255, 0.3)'
+                            },
+                            rows: 24,
+                            cols: 80
+                        });
+                        
+                        // 3. 加载 fit 插件
+                        const fitAddon = new FitAddon.FitAddon();
+                        terminal.loadAddon(fitAddon);
+                        
+                        // 4. 挂载到 DOM
+                        const terminalElement = document.getElementById('terminal');
+                        if (!terminalElement) {
+                            throw new Error('Terminal element not found');
+                        }
+                        terminal.open(terminalElement);
+                        fitAddon.fit();
+                        
+                        this.shell.terminal = terminal;
+                        this.shell.fitAddon = fitAddon;
+                        
+                        // 5. 建立 WebSocket 连接
+                        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                        const wsUrl = `${protocol}//${window.location.host}/api2/json/nodes/${this.nodename}/vncwebsocket?port=${this.shell.port}&vncticket=${encodeURIComponent(this.shell.ticket)}`;
+                        
+                        const socket = new WebSocket(wsUrl);
+                        socket.binaryType = 'arraybuffer';
+                        
+                        socket.onopen = () => {
+                            this.shell.connected = true;
+                            this.shell.connecting = false;
+                            
+                            // 发送终端大小
+                            const size = `1:${terminal.cols}:${terminal.rows}:`;
+                            socket.send(size);
+                            
+                            // 绑定终端输入事件
+                            terminal.onData(data => {
+                                if (socket.readyState === WebSocket.OPEN) {
+                                    socket.send('0:' + data.length + ':' + data);
+                                }
+                            });
+                            
+                            // 监听窗口大小变化
+                            window.addEventListener('resize', this.handleShellResize);
+                        };
+                        
+                        socket.onmessage = (event) => {
+                            if (typeof event.data === 'string') {
+                                terminal.write(event.data);
+                            } else {
+                                // 处理二进制数据
+                                const decoder = new TextDecoder('utf-8');
+                                const text = decoder.decode(event.data);
+                                terminal.write(text);
+                            }
+                        };
+                        
+                        socket.onerror = (error) => {
+                            console.error('WebSocket error:', error);
+                            this.shell.error = true;
+                            this.shell.connecting = false;
+                            this.showToast('终端连接错误', 'error');
+                        };
+                        
+                        socket.onclose = () => {
+                            this.shell.connected = false;
+                            this.shell.connecting = false;
+                            if (!this.shell.error) {
+                                this.showToast('终端连接已关闭', 'error');
+                            }
+                            window.removeEventListener('resize', this.handleShellResize);
+                        };
+                        
+                        this.shell.socket = socket;
+                        
+                    } catch (error) {
+                        this.shell.connecting = false;
+                        this.shell.error = true;
+                        this.showToast('初始化终端失败: ' + error.message, 'error');
+                        console.error('Shell init error:', error);
+                    }
+                },
+                
+                handleShellResize() {
+                    if (this.shell.terminal && this.shell.fitAddon && this.shell.socket) {
+                        this.shell.fitAddon.fit();
+                        const terminal = this.shell.terminal;
+                        if (this.shell.socket.readyState === WebSocket.OPEN) {
+                            const size = `1:${terminal.cols}:${terminal.rows}:`;
+                            this.shell.socket.send(size);
+                        }
+                    }
+                },
+                
+                closeShell() {
+                    this.cleanupShell();
+                    this.currentPage = 'list';
+                },
+                
+                cleanupShell() {
+                    // 移除窗口大小监听
+                    window.removeEventListener('resize', this.handleShellResize);
+                    
+                    // 关闭 WebSocket
+                    if (this.shell.socket) {
+                        if (this.shell.socket.readyState === WebSocket.OPEN) {
+                            this.shell.socket.close();
+                        }
+                        this.shell.socket = null;
+                    }
+                    
+                    // 销毁终端
+                    if (this.shell.terminal) {
+                        this.shell.terminal.dispose();
+                        this.shell.terminal = null;
+                    }
+                    
+                    // 重置状态
+                    this.shell.fitAddon = null;
+                    this.shell.connected = false;
+                    this.shell.connecting = false;
+                    this.shell.error = false;
+                    this.shell.ticket = null;
+                    this.shell.port = null;
                 }
             },
             
