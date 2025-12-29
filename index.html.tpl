@@ -1757,9 +1757,13 @@
                 closeShell() {
                     this.cleanupShell();
                     this.currentPage = 'list';
-                    // 使用浏览器返回
-                    if (window.history.length > 1) {
-                        history.back();
+                    this.selectedVM = null;
+                    // 清除监控定时器
+                    if (this.monitorInterval) {
+                        clearInterval(this.monitorInterval);
+                    }
+                    if (this.countdownInterval) {
+                        clearInterval(this.countdownInterval);
                     }
                 },
                 
